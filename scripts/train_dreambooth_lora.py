@@ -38,7 +38,7 @@ lora_config = LoraConfig(
     lora_alpha=16,
     target_modules=["to_q", "to_k", "to_v", "to_out.0"],
     bias="none",
-    task_type="CAUSAL_LM",  # ⚠️ workaround – PEFT chce task_type, ale použiješ jen get_peft_model
+    task_type="UNET",  # ⚠️ workaround – PEFT chce task_type, ale použiješ jen get_peft_model
 )
 unet = get_peft_model(unet, lora_config)
 
