@@ -1,92 +1,89 @@
 import os
 import torch
-from PIL import Image
-from datasets import Dataset
-from diffusers import StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import StableDiffusionPipeline, UNet2DConditionModel, DDPMScheduler
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer
-from torch.utils.data import DataLoader
+from PIL import Image
 from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# Cesty
-IMAGE_DIR = "data/images_augmented"
-CAPTIONS_PATH = "data/captions/captions.txt"
-OUTPUT_DIR = "models/lora_output"
+# Config
 MODEL_NAME = "runwayml/stable-diffusion-v1-5"
-
-# Konfigurace
-IMAGE_SIZE = 512
+OUTPUT_DIR = "outputs/igloonet_penguin_unet"
+IMAGE_DIR = "data/images_png"
+EPOCHS = 3
 BATCH_SIZE = 1
-EPOCHS = 5
-LR = 1e-4
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LR = 1e-5
 
-# Načtení captionů
-with open(CAPTIONS_PATH, "r") as f:
-    lines = f.readlines()
-    entries = [line.strip().split("|") for line in lines]
+# Dataset class
+class PenguinDataset(Dataset):
+    def __init__(self, image_dir, image_size=(512, 512)):
+        self.image_dir = image_dir
+        self.image_paths = [os.path.join(image_dir, f) for f in os.listdir(image_dir) if f.endswith(".png")]
+        self.transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ])
 
-data = [{"image_path": os.path.join(IMAGE_DIR, img), "caption": caption} for img, caption in entries]
+    def __len__(self):
+        return len(self.image_paths)
 
-dataset = Dataset.from_list(data)
+    def __getitem__(self, idx):
+        image = Image.open(self.image_paths[idx]).convert("RGB")
+        return self.transform(image)
 
-# Tokenizace
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# Load pretrained pipeline
+pipe = StableDiffusionPipeline.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float32,
+    safety_checker=None
+)
 
-# Pipeline pro načtení a použití UNetu
-pipe = StableDiffusionPipeline.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).to(DEVICE)
+pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+
+# Load UNet and apply LoRA
 unet = pipe.unet
+lora_config = LoraConfig(
+    r=4,
+    lora_alpha=16,
+    target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+    lora_dropout=0.1,
+    bias="none",
+    task_type="UNET"
+)
+unet = get_peft_model(unet, lora_config)
 
-# LoRA konfigurace
-lora_config = LoraConfig(r=4, lora_alpha=16, target_modules=["to_k", "to_q"], lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
-peft_unet = get_peft_model(unet, lora_config)
+# Prepare dataset and dataloader
+dataset = PenguinDataset(IMAGE_DIR)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-# Dataset a transformace
-transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5], [0.5])
-])
+# Set up training
+optimizer = torch.optim.AdamW(unet.parameters(), lr=LR)
+unet.train()
 
-def preprocess(example):
-    image = Image.open(example["image_path"]).convert("RGB")
-    image = transform(image)
-    caption = example["caption"]
-    input_ids = tokenizer(caption, padding="max_length", max_length=77, return_tensors="pt").input_ids[0]
-    return {"pixel_values": image, "input_ids": input_ids}
-
-# Předzpracování dat
-processed = dataset.map(preprocess)
-dataloader = DataLoader(processed, batch_size=BATCH_SIZE, shuffle=True)
-
-# Tréninková smyčka
-optimizer = torch.optim.AdamW(peft_unet.parameters(), lr=LR)
-peft_unet.train()
-
-print("\n🚀 Starting LoRA training on GCP GPU...")
-
+# Training loop
 for epoch in range(EPOCHS):
-    total_loss = 0
+    epoch_loss = 0.0
     for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
-        images = batch["pixel_values"].to(DEVICE).unsqueeze(1)
-        input_ids = batch["input_ids"].to(DEVICE)
-
-        noise = torch.randn_like(images).to(DEVICE)
-        timesteps = torch.randint(0, 1000, (images.size(0),), device=DEVICE).long()
+        images = batch
+        noise = torch.randn_like(images)
+        timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (BATCH_SIZE,), dtype=torch.long)
         noisy_images = pipe.scheduler.add_noise(images, noise, timesteps)
-        encoder_hidden_states = pipe.text_encoder(input_ids)[0]
 
-        noise_pred = peft_unet(noisy_images, timesteps, encoder_hidden_states).sample
+        encoder_hidden_states = torch.randn((BATCH_SIZE, 77, 768))
+        noise_pred = unet(noisy_images, timesteps, encoder_hidden_states).sample
+
         loss = torch.nn.functional.mse_loss(noise_pred, noise)
-
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
-        total_loss += loss.item()
+        epoch_loss += loss.item()
 
-    print(f"✅ Epoch {epoch+1}: loss = {total_loss / len(dataloader):.4f}")
+    avg_loss = epoch_loss / len(dataloader)
+    print(f"Loss: {avg_loss:.4f}")
 
-# Uložení modelu
-peft_unet.save_pretrained(OUTPUT_DIR)
-print(f"\n✅ Model uložen do složky {OUTPUT_DIR}")
+# Save the fine-tuned UNet
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+unet.save_pretrained(OUTPUT_DIR)
+print(f"\n✅ Training complete – model saved to {OUTPUT_DIR}!")
