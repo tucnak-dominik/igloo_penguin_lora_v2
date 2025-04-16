@@ -23,7 +23,7 @@ from tqdm import tqdm
 model_id = "runwayml/stable-diffusion-v1-5"
 instance_prompt = "a photo of igloo penguin"
 output_dir = "outputs/igloonet_penguin_lora_v2"
-data_dir = "data/images_png_augmented"
+data_dir = "data/images_png"  # ✅ OPRAVENO
 
 resolution = 512
 batch_size = 1
@@ -39,8 +39,13 @@ pipe = StableDiffusionPipeline.from_pretrained(
 
 # Dataset loading
 image_paths = list(Path(data_dir).glob("*.png"))
+
+# 🐞 DEBUG výpisy
+print("📁 Načítám obrázky ze složky:", os.path.abspath(data_dir))
+print("🖼️ Počet nalezených obrázků:", len(image_paths))
+
 if not image_paths:
-    raise ValueError("Nenalezeny žádné obrázky pro trénink.")
+    raise ValueError(f"Nenalezeny žádné obrázky pro trénink ve složce: {data_dir}")
 
 def load_images():
     images = []
@@ -50,7 +55,7 @@ def load_images():
     return images
 
 train_images = load_images()
-print(f"Nahráno {len(train_images)} obrázků pro trénink.")
+print(f"✅ Nahráno {len(train_images)} obrázků pro trénink.")
 
 # ========== TRÉNINK ========== #
 from diffusers import StableDiffusionLoRATrainer
@@ -67,6 +72,7 @@ trainer = StableDiffusionLoRATrainer(
     resolution=resolution,
 )
 
+print("🚀 Spouštím trénink...")
 trainer.train()
 
 # Uložení
