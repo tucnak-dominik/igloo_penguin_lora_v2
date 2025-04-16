@@ -1,81 +1,104 @@
-import torch
-from diffusers import StableDiffusionPipeline, DDPMScheduler, UNet2DConditionModel, AutoencoderKL
-from transformers import CLIPTokenizer
-from peft import LoraConfig, get_peft_model
-from torchvision import transforms
-from PIL import Image
 import os
 from pathlib import Path
+from PIL import Image
+import torch
+from tqdm import tqdm
+from transformers import CLIPTokenizer
+from diffusers import (
+    StableDiffusionPipeline,
+    DDPMScheduler,
+    AutoencoderKL,
+    UNet2DConditionModel,
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-# 📦 Konfigurace
+# ========== NASTAVENÍ ========== #
 model_id = "runwayml/stable-diffusion-v1-5"
-data_dir = "data/images_augmented"
-output_dir = "outputs/igloonet_penguin_lora"
 instance_prompt = "a photo of igloo penguin"
-image_size = 512
-learning_rate = 1e-4
+output_dir = "outputs/igloonet_penguin_lora_v2"
+data_dir = "data/images_augmented"
+
+resolution = 512
 batch_size = 1
-epochs = 10
+learning_rate = 1e-4
+num_epochs = 4
 
+# ========== MODELY ========== #
 print("📦 Načítám model...")
-pipe = StableDiffusionPipeline.from_pretrained(
-    model_id,
-    torch_dtype=torch.float16,
-    safety_checker=None
-).to("cuda")
 
-tokenizer = CLIPTokenizer.from_pretrained(model_id)
+tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
 vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to("cuda", dtype=torch.float16)
 unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to("cuda", dtype=torch.float16)
 
-# ⚙️ LoRA konfigurace
+# ========== PŘIDÁNÍ LoRA ========== #
+print("🧠 Přidávám LoRA váhy do UNet...")
+
 lora_config = LoraConfig(
     r=4,
     lora_alpha=16,
     target_modules=["to_q", "to_k", "to_v", "to_out.0"],
     bias="none",
-    task_type="CAUSAL_LM"
+    task_type="CAUSAL_LM",  # ⚠️ workaround – PEFT chce task_type, ale použiješ jen get_peft_model
 )
-
 unet = get_peft_model(unet, lora_config)
 
-# 📁 Dataset
-def load_images(image_folder):
-    image_paths = list(Path(image_folder).glob("*.png"))
-    print(f"📁 Načítám obrázky ze složky: {image_folder}")
-    print(f"🖼️ Počet nalezených obrázků: {len(image_paths)}")
-    preprocess = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
-    ])
+# ========== DATA ========== #
+print(f"📁 Načítám obrázky ze složky: {data_dir}")
+image_paths = list(Path(data_dir).glob("*.png"))
+print(f"🖼️ Počet nalezených obrázků: {len(image_paths)}")
+
+if not image_paths:
+    raise ValueError("Nenalezeny žádné obrázky pro trénink.")
+
+def load_images():
     images = []
     for path in image_paths:
-        img = Image.open(path).convert("RGB")
-        images.append(preprocess(img))
-    return torch.stack(images)
+        img = Image.open(path).convert("RGB").resize((resolution, resolution))
+        images.append(img)
+    return images
 
-images = load_images(data_dir).to("cuda")
+train_images = load_images()
+print(f"✅ Nahráno {len(train_images)} obrázků pro trénink.")
 
-# 🧠 Trénink
+# ========== TRÉNINK ========== #
+print("🚀 Spouštím trénink...")
+
 optimizer = torch.optim.AdamW(unet.parameters(), lr=learning_rate)
 
-print(f"🧠 Spouštím trénink na {len(images)} obrázcích...")
-for epoch in range(epochs):
-    total_loss = 0.0
-    for i in range(0, len(images), batch_size):
-        batch = images[i:i + batch_size]
-        noise = torch.randn_like(batch).to("cuda")
-        noisy_images = batch + noise * 0.1
-        optimizer.zero_grad()
-        output = unet(noisy_images, timestep=torch.tensor([10] * len(batch)).to("cuda"), encoder_hidden_states=None)
-        loss = ((output.sample - batch) ** 2).mean()
+unet.train()
+for epoch in range(num_epochs):
+    print(f"🧪 Epoch {epoch + 1}/{num_epochs}")
+    for img in tqdm(train_images):
+        pixel_values = torch.tensor(
+            (torch.tensor(img).permute(2, 0, 1) / 255.0).unsqueeze(0),
+            dtype=torch.float16,
+        ).to("cuda")
+
+        with torch.no_grad():
+            latents = vae.encode(pixel_values).latent_dist.sample() * 0.18215
+
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(0, 1000, (1,), device="cuda").long()
+
+        noisy_latents = DDPMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear").add_noise(
+            latents, noise, timesteps
+        )
+
+        encoder_hidden_states = tokenizer(
+            instance_prompt, return_tensors="pt"
+        ).input_ids.to("cuda")
+
+        model_pred = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+        loss = torch.nn.functional.mse_loss(model_pred, noise)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
-    print(f"🔁 Epoch {epoch + 1}/{epochs} - Loss: {total_loss:.4f}")
+        optimizer.zero_grad()
 
-# 💾 Uložení modelu
+    print(f"✅ Epoch {epoch + 1} hotová!")
+
+# ========== ULOŽENÍ ========== #
+print(f"💾 Ukládám LoRA váhy do složky: {output_dir}")
 os.makedirs(output_dir, exist_ok=True)
 unet.save_pretrained(output_dir)
-print(f"✅ Trénink dokončen – výstupní složka: {output_dir}")
+
+print("\n✅ Trénink dokončen! Lovec Šterbin je připraven generovat tučňáky.")
