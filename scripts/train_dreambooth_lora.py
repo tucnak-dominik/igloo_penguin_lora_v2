@@ -6,9 +6,10 @@ from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 import pandas as pd
+import torch.nn.functional as F
 
-from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL
-from transformers import CLIPTokenizer
+from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
+from transformers import CLIPTokenizer, CLIPTextModel
 from peft import LoraConfig, get_peft_model
 
 # ========== Nastavení ==========
@@ -31,6 +32,9 @@ print("📦 Načítám model...")
 pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
 unet: UNet2DConditionModel = pipe.unet
 vae: AutoencoderKL = pipe.vae
+tokenizer: CLIPTokenizer = pipe.tokenizer
+text_encoder: CLIPTextModel = pipe.text_encoder
+noise_scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
 # ========== Přidání LoRA váh ==========
 print("🧠 Přidávám LoRA váhy do UNet...")
@@ -65,7 +69,7 @@ def load_images():
 train_images = load_images()
 print(f"🖼️ Počet nalezených obrázků: {len(train_images)}")
 
-# ========== Trénink (mock) ==========
+# ========== Trénink (reálný) ==========
 print("🚀 Spouštím trénink...")
 
 optimizer = torch.optim.Adam(unet.parameters(), lr=learning_rate)
@@ -76,9 +80,24 @@ for epoch in range(num_epochs):
         optimizer.zero_grad()
         caption = captions_df[captions_df["file_name"] == path.name]["caption"].values[0]
 
-        # Zde by mělo být zakódování promtu přes text encoder + noise prediction + loss
-        # → Nahraď následující řádek reálným výpočtem loss při integraci s plným DreamBooth tréninkem
-        loss = torch.rand(1).to("cuda")  # dummy loss
+        # Tokenizace textu a extrakce hidden states
+        inputs = tokenizer(caption, return_tensors="pt", padding="max_length", truncation=True, max_length=77).to("cuda")
+        encoder_hidden_states = text_encoder(**inputs).last_hidden_state
+
+        # Získání latentního kódu z obrázku přes VAE
+        with torch.no_grad():
+            latents = vae.encode(img_tensor).latent_dist.sample() * 0.18215
+
+        # Přidání náhodného šumu
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (1,), device="cuda").long()
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Predikce šumu přes UNet
+        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+
+        # Výpočet loss
+        loss = F.mse_loss(noise_pred.float(), noise.float())
 
         loss.backward()
         optimizer.step()
