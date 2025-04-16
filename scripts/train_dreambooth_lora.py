@@ -1,111 +1,142 @@
 import os
 import torch
-from torch import nn
-from torchvision import transforms
-from PIL import Image
-from pathlib import Path
+import numpy as np
 from tqdm import tqdm
-import pandas as pd
-import torch.nn.functional as F
-
-from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
+from PIL import Image
 from transformers import CLIPTokenizer, CLIPTextModel
+from diffusers import StableDiffusionPipeline, DDPMScheduler, UNet2DConditionModel, AutoencoderKL
+from diffusers.optimization import get_scheduler
 from peft import LoraConfig, get_peft_model
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import argparse
 
-# ========== Nastavení ==========
-model_id = "runwayml/stable-diffusion-v1-5"
-instance_prompt = "a penguin"
-validation_prompt = "a penguin in igloonet style"
 
-instance_data_dir = "data/images_augmented"
-captions_path = "data/captions/captions.csv"
-output_dir = "outputs/igloo_penguin_lora"
+class CustomDataset(Dataset):
+    def __init__(self, image_dir, caption_file, tokenizer, resolution):
+        self.image_dir = image_dir
+        self.tokenizer = tokenizer
+        self.resolution = resolution
 
-resolution = 512
-batch_size = 1
-learning_rate = 1e-4
-max_train_steps = 1000
-num_epochs = 4
+        df = pd.read_csv(caption_file)
+        self.items = df.to_dict(orient="records")
 
-# ========== Načtení modelu ==========
-print("📦 Načítám model...")
-pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
-unet: UNet2DConditionModel = pipe.unet
-vae: AutoencoderKL = pipe.vae
-tokenizer: CLIPTokenizer = pipe.tokenizer
-text_encoder: CLIPTextModel = pipe.text_encoder
-noise_scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+    def __len__(self):
+        return len(self.items)
 
-# ========== Přidání LoRA váh ==========
-print("🧠 Přidávám LoRA váhy do UNet...")
-lora_config = LoraConfig(
-    r=4,
-    lora_alpha=16,
-    target_modules=["to_q", "to_k", "to_v", "to_out.0"],
-    lora_dropout=0.1,
-    bias="none",
-    task_type="UNET"
-)
-unet = get_peft_model(unet, lora_config)
+    def __getitem__(self, idx):
+        item = self.items[idx]
+        image_path = os.path.join(self.image_dir, item["file_name"])
+        caption = item["caption"].strip()
 
-# ========== Načtení dat ==========
-print(f"📁 Načítám obrázky ze složky: {instance_data_dir}")
-image_paths = sorted(Path(instance_data_dir).glob("*.png"))
-captions_df = pd.read_csv(captions_path)
+        if caption == "":
+            caption = "a penguin"
 
-transform = transforms.Compose([
-    transforms.Resize((resolution, resolution)),
-    transforms.ToTensor(),
-])
+        image = Image.open(image_path).convert("RGB")
+        image = image.resize((self.resolution, self.resolution))
+        image = np.array(image).astype(np.float32) / 255.0
+        image = torch.tensor(image).permute(2, 0, 1)
 
-def load_images():
-    images = []
-    for path in image_paths:
-        img = Image.open(path).convert("RGB")
-        tensor = transform(img).half().unsqueeze(0).to("cuda")
-        images.append(tensor)
-    return images
+        tokens = self.tokenizer(
+            caption,
+            truncation=True,
+            padding="max_length",
+            max_length=77,
+            return_tensors="pt"
+        )
 
-train_images = load_images()
-print(f"🖼️ Počet nalezených obrázků: {len(train_images)}")
+        return {
+            "pixel_values": image,
+            "input_ids": tokens.input_ids.squeeze(0),
+            "attention_mask": tokens.attention_mask.squeeze(0),
+        }
 
-# ========== Trénink (reálný) ==========
-print("🚀 Spouštím trénink...")
 
-optimizer = torch.optim.Adam(unet.parameters(), lr=learning_rate)
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-for epoch in range(num_epochs):
-    print(f"🧪 Epoch {epoch + 1}/{num_epochs}")
-    for i, (img_tensor, path) in enumerate(zip(train_images, image_paths)):
-        optimizer.zero_grad()
-        caption = captions_df[captions_df["file_name"] == path.name]["caption"].values[0]
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder").to(device)
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae").to(device)
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
 
-        # Tokenizace textu a extrakce hidden states
-        inputs = tokenizer(caption, return_tensors="pt", padding="max_length", truncation=True, max_length=77).to("cuda")
-        encoder_hidden_states = text_encoder(**inputs).last_hidden_state
+    lora_config = LoraConfig(r=4, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.05, bias="none")
+    unet = get_peft_model(unet, lora_config).to(device)
 
-        # Získání latentního kódu z obrázku přes VAE
-        with torch.no_grad():
-            latents = vae.encode(img_tensor).latent_dist.sample() * 0.18215
+    dataset = CustomDataset(
+        image_dir=args.instance_data_dir,
+        caption_file=args.caption_file,
+        tokenizer=tokenizer,
+        resolution=args.resolution,
+    )
+    dataloader = DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True)
 
-        # Přidání náhodného šumu
-        noise = torch.randn_like(latents)
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (1,), device="cuda").long()
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+    optimizer = torch.optim.AdamW(unet.parameters(), lr=args.learning_rate)
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=args.max_train_steps,
+    )
 
-        # Predikce šumu přes UNet
-        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-        # Výpočet loss
-        loss = F.mse_loss(noise_pred.float(), noise.float())
+    unet.train()
+    for epoch in range(args.max_train_steps // len(dataloader)):
+        print(f"🧪 Epoch {epoch + 1}/{args.max_train_steps // len(dataloader)}")
+        for step, batch in enumerate(tqdm(dataloader, desc="🔄 Training")):
+            with torch.no_grad():
+                latents = vae.encode(batch["pixel_values"].to(device)).latent_dist.sample() * 0.18215
 
-        loss.backward()
-        optimizer.step()
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        if (i + 1) % 25 == 0:
-            print(f"  🔄 Step {i + 1}/{len(train_images)} - Loss: {loss.item():.4f}")
+            encoder_hidden_states = text_encoder(
+                input_ids=batch["input_ids"].to(device),
+                attention_mask=batch["attention_mask"].to(device),
+            )[0]
 
-# ========== Uložení ==========
-os.makedirs(output_dir, exist_ok=True)
-unet.save_pretrained(output_dir)
-print(f"✅ Trénink dokončen. Model uložen do: {output_dir}")
+            noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            loss = torch.nn.functional.mse_loss(noise_pred, noise)
+
+            if torch.isnan(loss):
+                print("⚠️ Loss je NaN, přeskočeno")
+                continue
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+            if step % 10 == 0:
+                print(f"   🔄 Step {step}/{len(dataloader)} - Loss: {loss.item():.4f}")
+
+    unet.save_pretrained(args.output_dir)
+    print("✅ Trénink dokončen a model uložen.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
+    parser.add_argument("--instance_data_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--instance_prompt", type=str, default="a penguin")
+    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--train_batch_size", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--max_train_steps", type=int, default=1000)
+    parser.add_argument("--checkpointing_steps", type=int, default=250)
+    parser.add_argument("--validation_prompt", type=str, default="a penguin in igloonet style")
+    parser.add_argument("--report_to", type=str, default="none")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--lr_scheduler", type=str, default="constant")
+    parser.add_argument("--mixed_precision", type=str, default="no")
+    parser.add_argument("--use_8bit_adam", action="store_true")
+    parser.add_argument("--train_text_encoder", action="store_true")
+    parser.add_argument("--caption_column", type=str, default="caption")
+    parser.add_argument("--caption_file", type=str, required=True)
+    args = parser.parse_args()
+
+    train(args)
