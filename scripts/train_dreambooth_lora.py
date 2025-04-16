@@ -1,19 +1,15 @@
-# 🧩 Instalace všech potřebných balíčků
-!pip install -q diffusers transformers accelerate peft safetensors torchvision
-
-# 📦 Konfigurace
 import torch
 from diffusers import StableDiffusionPipeline, DDPMScheduler, UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model
 from torchvision import transforms
 from PIL import Image
 import os
 from pathlib import Path
-from tqdm import tqdm
 
+# 📦 Konfigurace
 model_id = "runwayml/stable-diffusion-v1-5"
-data_dir = "data/images_augmented"  # ❗ tvůj správný adresář
+data_dir = "data/images_augmented"
 output_dir = "outputs/igloonet_penguin_lora"
 instance_prompt = "a photo of igloo penguin"
 image_size = 512
@@ -21,7 +17,6 @@ learning_rate = 1e-4
 batch_size = 1
 epochs = 10
 
-# 📦 Načtení pipeline
 print("📦 Načítám model...")
 pipe = StableDiffusionPipeline.from_pretrained(
     model_id,
@@ -33,7 +28,7 @@ tokenizer = CLIPTokenizer.from_pretrained(model_id)
 vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to("cuda", dtype=torch.float16)
 unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to("cuda", dtype=torch.float16)
 
-# ⚙️ Příprava PEFT konfigurace (LoRA)
+# ⚙️ LoRA konfigurace
 lora_config = LoraConfig(
     r=4,
     lora_alpha=16,
@@ -44,9 +39,11 @@ lora_config = LoraConfig(
 
 unet = get_peft_model(unet, lora_config)
 
-# 🖼️ Příprava datasetu
+# 📁 Dataset
 def load_images(image_folder):
     image_paths = list(Path(image_folder).glob("*.png"))
+    print(f"📁 Načítám obrázky ze složky: {image_folder}")
+    print(f"🖼️ Počet nalezených obrázků: {len(image_paths)}")
     preprocess = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
@@ -60,10 +57,10 @@ def load_images(image_folder):
 
 images = load_images(data_dir).to("cuda")
 
-# 🧠 TRÉNINK – jednoduchá trénovací smyčka
+# 🧠 Trénink
 optimizer = torch.optim.AdamW(unet.parameters(), lr=learning_rate)
 
-print(f"🧠 Začíná trénink na {len(images)} obrázcích...")
+print(f"🧠 Spouštím trénink na {len(images)} obrázcích...")
 for epoch in range(epochs):
     total_loss = 0.0
     for i in range(0, len(images), batch_size):
@@ -81,4 +78,4 @@ for epoch in range(epochs):
 # 💾 Uložení modelu
 os.makedirs(output_dir, exist_ok=True)
 unet.save_pretrained(output_dir)
-print(f"✅ Hotovo! LoRA váhy jsou uloženy v {output_dir}")
+print(f"✅ Trénink dokončen – výstupní složka: {output_dir}")
