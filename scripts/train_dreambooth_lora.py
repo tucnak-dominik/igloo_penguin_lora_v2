@@ -28,7 +28,7 @@ pipeline = StableDiffusionPipeline.from_pretrained(
     safety_checker=None
 ).to("cuda")
 
-tokenizer = CLIPTokenizer.from_pretrained(model_id)
+tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
 unet = pipeline.unet
 vae = pipeline.vae
 scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
