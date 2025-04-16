@@ -23,7 +23,7 @@ from tqdm import tqdm
 model_id = "runwayml/stable-diffusion-v1-5"
 instance_prompt = "a photo of igloo penguin"
 output_dir = "outputs/igloonet_penguin_lora_v2"
-data_dir = "data/images_png"  # ✅ OPRAVENO
+data_dir = "data/images_augmented"
 
 resolution = 512
 batch_size = 1
